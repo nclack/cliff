@@ -6,18 +6,24 @@ const std = @import("std");
 /// That is if a = e_k..e_0 and b = e_j..e_0 then ab = e_k..e_0 e_j .. e_0.
 /// We want to know the swaps required to order those so we can rewrite
 /// ab = e_k .. e_j .. e_0 e_0 (assuming k>=j in this example).
-fn swaps(a: u8, b: u8) u8 {
+fn swaps(a: u8, b: u8, comptime rank: u8) u8 {
     var acc: u8 = 0;
-    inline for (1..8) |i| {
+    inline for (1..rank) |i| {
         acc += @popCount(a & (b >> i));
     }
     return acc;
 }
 
 const MetricSignature = struct {
+    const Self = @This();
+
     positive: u8,
     zero: u8,
     negative: u8,
+
+    fn rank(comptime self: Self) u8 {
+        return self.positive + self.zero + self.negative;
+    }
 };
 
 /// Make the metric
@@ -27,9 +33,15 @@ pub fn Metric(comptime sig: MetricSignature) type {
     // Use middle bits for vectors squaring to -1
     //
     // The metric just stores the masks for the vectors squaring to 0 or -1.
+    comptime {
+        if (sig.rank() > 8) {
+            @compileError("Algebras must have at most 8 dimensions.");
+        }
+    }
     return struct {
         const Self = @This();
 
+        const rank: u8 = sig.rank();
         comptime negative: u8 = ((1 << sig.negative) - 1) << sig.positive,
         comptime zero: u8 = ((1 << sig.zero) - 1) << (sig.positive + sig.negative),
     };
@@ -46,14 +58,6 @@ pub fn Blade(comptime sig: MetricSignature, comptime Field: type) type {
         signature: u8,
         /// the magnitude of this blade.
         magnitude: Field,
-
-        /// Scale this blade by a scalar
-        pub fn scale(self: Self, s: Field) Self {
-            return .{
-                .signature = self.signature,
-                .magnitude = self.magnitude * s,
-            };
-        }
 
         /// Compare two blades for approximate equality
         pub fn approxEql(self: Self, other: Self, tolerance: Field) bool {
@@ -81,19 +85,30 @@ pub fn Blade(comptime sig: MetricSignature, comptime Field: type) type {
             }
         }
 
-        pub fn mul(lhs: *Self, rhs: *Self) Self {
-            const metric = SelfMetric{};
-            const squares: u8 = lhs.signature & rhs.signature;
-            if ((squares & metric.zero) != 0) {
-                return SelfBasis.zero;
-            }
+        pub fn mul(self: Self, rhs: anytype) Self {
+            const RhsType = @TypeOf(rhs);
+            return switch (RhsType) {
+                Field, comptime_float, comptime_int => .{
+                    .signature = self.signature,
+                    .magnitude = self.magnitude * rhs,
+                },
+                Self => blk: {
+                    const metric = SelfMetric{};
+                    const squares: u8 = self.signature & rhs.signature;
+                    if ((squares & metric.zero) != 0) {
+                        break :blk SelfBasis.zero;
+                    }
 
-            const swap: f32 = if ((swaps(lhs.signature, rhs.signature) & 1) != 0) -1 else 1;
-            const sign: f32 = if ((@popCount(squares & metric.negative) & 1) != 0) -1 else 1;
+                    const swap: f32 = if ((swaps(self.signature, rhs.signature, SelfMetric.rank) & 1) != 0) -1 else 1;
+                    const sign: f32 = if ((@popCount(squares & metric.negative) & 1) != 0) -1 else 1;
 
-            return .{
-                .signature = lhs.signature ^ rhs.signature,
-                .magnitude = lhs.magnitude * rhs.magnitude * swap * sign,
+                    break :blk .{
+                        .signature = self.signature ^ rhs.signature,
+                        .magnitude = self.magnitude * rhs.magnitude * swap * sign,
+                    };
+                },
+                *Self, *const Self => self.mul(rhs.*),
+                else => @compileError("mul expects either a Blade or a scalar (Field type)"),
             };
         }
     };
@@ -142,107 +157,107 @@ fn expectBladeEqual(result: anytype, expected: @TypeOf(result), tolerance: f32) 
 }
 
 test "Euclidian: scalar multiplication" {
-    var a = euclidean.one.scale(2.0);
-    var b = euclidean.e0.scale(3.0);
-    const result = a.mul(&b);
-    const expected = euclidean.e0.scale(6.0);
+    var a = euclidean.one.mul(2.0);
+    const b = euclidean.e0.mul(3.0);
+    const result = a.mul(b);
+    const expected = euclidean.e0.mul(6.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Euclidean: e0 * e0 = 1" {
     var a = euclidean.e0;
-    const result = a.mul(&a);
+    const result = a.mul(a);
     try expectBladeEqual(result, euclidean.one, 1e-6);
 }
 
 test "Euclidean: e0 * e1 = -e01" {
     var a = euclidean.e0;
-    var b = euclidean.e1;
-    const result = a.mul(&b);
-    const expected = euclidean.e01.scale(-1.0);
+    const b = euclidean.e1;
+    const result = a.mul(b);
+    const expected = euclidean.e01.mul(-1.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Euclidean: e1 * e0 = e01" {
     var a = euclidean.e1;
-    var b = euclidean.e0;
-    const result = a.mul(&b);
+    const b = euclidean.e0;
+    const result = a.mul(b);
     try expectBladeEqual(result, euclidean.e01, 1e-6);
 }
 
 test "Euclidean: e1 * e023 = e0123" {
     var a = euclidean.e1;
-    var b = euclidean.e023;
-    const result = a.mul(&b);
+    const b = euclidean.e023;
+    const result = a.mul(b);
     try expectBladeEqual(result, euclidean.e0123, 1e-6);
 }
 
 test "Euclidean: e1 * e02 = -e012" {
     var a = euclidean.e1;
-    var b = euclidean.e02;
-    const result = a.mul(&b);
-    const expected = euclidean.e012.scale(-1.0);
+    const b = euclidean.e02;
+    const result = a.mul(b);
+    const expected = euclidean.e012.mul(-1.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Euclidean: coefficient propagation 2.5*e0 * 3.0*e1 = -7.5*e01" {
-    var a = euclidean.e0.scale(2.5);
-    var b = euclidean.e1.scale(3.0);
-    const result = a.mul(&b);
-    const expected = euclidean.e01.scale(-7.5);
+    var a = euclidean.e0.mul(2.5);
+    const b = euclidean.e1.mul(3.0);
+    const result = a.mul(b);
+    const expected = euclidean.e01.mul(-7.5);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Euclidean: negative coefficient -2.0*e0 * 3.0*e1 = 6.0*e01" {
-    var a = euclidean.e0.scale(-2.0);
-    var b = euclidean.e1.scale(3.0);
-    const result = a.mul(&b);
-    const expected = euclidean.e01.scale(6.0);
+    var a = euclidean.e0.mul(-2.0);
+    const b = euclidean.e1.mul(3.0);
+    const result = a.mul(b);
+    const expected = euclidean.e01.mul(6.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Euclidean: pseudoscalar squared = 1" {
     var a = euclidean.pseudoscalar;
-    const result = a.mul(&a);
+    const result = a.mul(a);
     try expectBladeEqual(result, euclidean.one, 1e-6);
 }
 
 test "Euclidean: e01 squared = -1" {
     var a = euclidean.e01;
-    const result = a.mul(&a);
-    const expected = euclidean.one.scale(-1.0);
+    const result = a.mul(a);
+    const expected = euclidean.one.mul(-1.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Minkowski: e3 * e3 = -1 (timelike)" {
     var a = minkowski3d.e3;
-    const result = a.mul(&a);
-    const expected = minkowski3d.one.scale(-1.0);
+    const result = a.mul(a);
+    const expected = minkowski3d.one.mul(-1.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Minkowski: e0 * e0 = 1 (spacelike)" {
     var a = minkowski3d.e0;
-    const result = a.mul(&a);
+    const result = a.mul(a);
     try expectBladeEqual(result, minkowski3d.one, 1e-6);
 }
 
 test "Minkowski: e3 * e03 = -e0" {
     var a = minkowski3d.e3;
-    var b = minkowski3d.e03;
-    const result = a.mul(&b);
-    const expected = minkowski3d.e0.scale(-1.0);
+    const b = minkowski3d.e03;
+    const result = a.mul(b);
+    const expected = minkowski3d.e0.mul(-1.0);
     try expectBladeEqual(result, expected, 1e-6);
 }
 
 test "Conformal: e4 * e4 = 0 (degenerate)" {
-    var a = conformal3d.e4.scale(5.0);
-    const result = a.mul(&a);
+    var a = conformal3d.e4.mul(5.0);
+    const result = a.mul(a);
     try expectBladeEqual(result, conformal3d.zero, 1e-6);
 }
 
 test "Conformal: e04 * e04 = 0 (degenerate)" {
-    var a = conformal3d.e04.scale(3.0);
-    const result = a.mul(&a);
+    var a = conformal3d.e04.mul(3.0);
+    const result = a.mul(a);
     try expectBladeEqual(result, conformal3d.zero, 1e-6);
 }
