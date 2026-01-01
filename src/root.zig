@@ -14,20 +14,20 @@ fn swaps(a: u8, b: u8, comptime rank: u8) u8 {
     return acc;
 }
 
-const MetricSignature = struct {
+const Signature = struct {
     const Self = @This();
 
     positive: u8,
-    zero: u8,
     negative: u8,
+    zero: u8,
 
     fn rank(comptime self: Self) u8 {
-        return self.positive + self.zero + self.negative;
+        return self.positive + self.negative + self.zero;
     }
 };
 
 /// Make the metric
-pub fn Metric(comptime sig: MetricSignature) type {
+pub fn Metric(comptime sig: Signature) type {
     // Use high bits for vectors squaring to 0
     // Use low bits for vectors squaring to 1
     // Use middle bits for vectors squaring to -1
@@ -48,7 +48,7 @@ pub fn Metric(comptime sig: MetricSignature) type {
 }
 
 /// A Blade is a scalar magnitude with a product of ordered unit vectors.
-pub fn Blade(comptime sig: MetricSignature, comptime Field: type) type {
+pub fn Blade(comptime sig: Signature, comptime Field: type) type {
     return struct {
         const Self = @This();
         const SelfMetric = Metric(sig);
@@ -114,38 +114,122 @@ pub fn Blade(comptime sig: MetricSignature, comptime Field: type) type {
     };
 }
 
-/// Unit basis blades with magnitude 1.0
-pub fn Basis(comptime sig: MetricSignature, comptime Field: type) type {
-    return struct {
-        pub const zero: Blade(sig, Field) = .{ .signature = 0x0, .magnitude = 0.0 };
-        pub const one: Blade(sig, Field) = .{ .signature = 0x0, .magnitude = 1.0 };
+/// Convert signature bits to field name (e.g., 0b0101 -> "e02")
+fn signatureToName(comptime signature: u8, comptime rank: u8) [:0]const u8 {
+    if (signature == 0) return "scalar";
 
-        pub const pseudoscalar: Blade(sig, Field) = .{ .signature = 0xff, .magnitude = 1.0 };
-
-        // Single basis vectors
-        pub const e0: Blade(sig, Field) = .{ .signature = 0b00000001, .magnitude = 1.0 };
-        pub const e1: Blade(sig, Field) = .{ .signature = 0b00000010, .magnitude = 1.0 };
-        pub const e2: Blade(sig, Field) = .{ .signature = 0b00000100, .magnitude = 1.0 };
-        pub const e3: Blade(sig, Field) = .{ .signature = 0b00001000, .magnitude = 1.0 };
-        pub const e4: Blade(sig, Field) = .{ .signature = 0b00010000, .magnitude = 1.0 };
-        pub const e5: Blade(sig, Field) = .{ .signature = 0b00100000, .magnitude = 1.0 };
-        pub const e6: Blade(sig, Field) = .{ .signature = 0b01000000, .magnitude = 1.0 };
-        pub const e7: Blade(sig, Field) = .{ .signature = 0b10000000, .magnitude = 1.0 };
-
-        // Multi-index blades for tests
-        pub const e01: Blade(sig, Field) = .{ .signature = 0b00000011, .magnitude = 1.0 };
-        pub const e02: Blade(sig, Field) = .{ .signature = 0b00000101, .magnitude = 1.0 };
-        pub const e03: Blade(sig, Field) = .{ .signature = 0b00001001, .magnitude = 1.0 };
-        pub const e04: Blade(sig, Field) = .{ .signature = 0b00010001, .magnitude = 1.0 };
-        pub const e012: Blade(sig, Field) = .{ .signature = 0b00000111, .magnitude = 1.0 };
-        pub const e023: Blade(sig, Field) = .{ .signature = 0b00001101, .magnitude = 1.0 };
-        pub const e0123: Blade(sig, Field) = .{ .signature = 0b00001111, .magnitude = 1.0 };
-    };
+    comptime var name: []const u8 = "e";
+    inline for (0..rank) |i| {
+        if ((signature >> @as(u4, @intCast(i))) & 1 == 1) {
+            const digit: []const u8 = switch (i) {
+                0 => "0",
+                1 => "1",
+                2 => "2",
+                3 => "3",
+                4 => "4",
+                5 => "5",
+                6 => "6",
+                7 => "7",
+                else => unreachable,
+            };
+            name = name ++ digit;
+        }
+    }
+    // Ensure null termination
+    const final: [:0]const u8 = name ++ "";
+    return final;
 }
 
-pub const euclidean = Basis(.{ .positive = 8, .zero = 0, .negative = 0 }, f32);
-pub const minkowski3d = Basis(.{ .positive = 3, .zero = 0, .negative = 1 }, f32);
-pub const conformal3d = Basis(.{ .positive = 3, .zero = 1, .negative = 1 }, f32);
+/// Unit basis blades with magnitude 1.0
+/// Returns an instance with all 2^rank basis blades auto-generated
+pub fn Basis(comptime sig: Signature, comptime Field: type) BasisInstance(sig, Field) {
+    return .{};
+}
+
+/// Generate a type with the 2^rank unit blades
+pub fn BasisInstance(comptime sig: Signature, comptime Field: type) type {
+    @setEvalBranchQuota(10000);
+    const rank = sig.rank();
+    const num_blades = @as(usize, 1) << @as(u4, @intCast(rank));
+
+    // Create persistent array of default values
+    const defaults = comptime blk: {
+        var defs: [num_blades + 2]Blade(sig, Field) = undefined;
+
+        // zero: scalar with magnitude 0
+        defs[0] = .{ .signature = 0, .magnitude = 0.0 };
+
+        // pseudoscalar
+        defs[1] = .{ .signature = 0xff, .magnitude = 1.0 };
+
+        // All 2^rank blades
+        // The first is one: a scalar with magnitude 1
+        for (0..num_blades) |signature| {
+            defs[signature + 2] = .{ .signature = @intCast(signature), .magnitude = 1.0 };
+        }
+
+        break :blk defs;
+    };
+
+    // Build struct fields for all possible blades
+    var fields: [num_blades + 2]std.builtin.Type.StructField = undefined;
+
+    // Special fields
+    fields[0] = .{
+        .name = "zero",
+        .type = Blade(sig, Field),
+        .default_value_ptr = @ptrCast(&defaults[0]),
+        .is_comptime = true,
+        .alignment = @alignOf(Blade(sig, Field)),
+    };
+
+    fields[1] = .{
+        .name = "pseudoscalar",
+        .type = Blade(sig, Field),
+        .default_value_ptr = @ptrCast(&defaults[1]),
+        .is_comptime = true,
+        .alignment = @alignOf(Blade(sig, Field)),
+    };
+
+    fields[2] = .{
+        .name = "one",
+        .type = Blade(sig, Field),
+        .default_value_ptr = @ptrCast(&defaults[2]),
+        .is_comptime = true,
+        .alignment = @alignOf(Blade(sig, Field)),
+    };
+
+    // Generate all 2^rank blades
+    inline for (1..num_blades) |signature| {
+        const sig_u8: u8 = @intCast(signature);
+        const name = signatureToName(sig_u8, rank);
+
+        fields[signature + 2] = .{
+            .name = name,
+            .type = Blade(sig, Field),
+            .default_value_ptr = @ptrCast(&defaults[signature + 2]),
+            .is_comptime = true,
+            .alignment = @alignOf(Blade(sig, Field)),
+        };
+    }
+
+    return @Type(.{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        },
+    });
+}
+
+pub const euclidean = Basis(.{ .positive = 8, .negative = 0, .zero = 0 }, f32);
+pub const euclidean3d = Basis(.{ .positive = 3, .negative = 0, .zero = 0 }, f32);
+pub const minkowski3d = Basis(.{ .positive = 3, .negative = 1, .zero = 0 }, f32);
+pub const projective2d = Basis(.{ .positive = 2, .negative = 0, .zero = 1 }, f32);
+pub const conformal2d = Basis(.{ .positive = 2, .negative = 1, .zero = 1 }, f32);
+pub const projective3d = Basis(.{ .positive = 3, .negative = 0, .zero = 1 }, f32);
+pub const conformal3d = Basis(.{ .positive = 3, .negative = 1, .zero = 1 }, f32);
 
 /// Test helper: check blade equality with diagnostic output on failure
 fn expectBladeEqual(result: anytype, expected: @TypeOf(result), tolerance: f32) !void {
