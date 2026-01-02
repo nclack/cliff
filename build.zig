@@ -16,11 +16,23 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     const run_tests = b.step("test", "Run tests");
-    const tests = b.addTest(.{
+
+    // Unit tests
+    const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
         }),
     });
-    run_tests.dependOn(&b.addRunArtifact(tests).step);
+    run_tests.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // Integration tests
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+        }),
+    });
+    integration_tests.root_module.addImport("cliff", lib.root_module);
+    run_tests.dependOn(&b.addRunArtifact(integration_tests).step);
 }

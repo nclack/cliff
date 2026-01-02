@@ -53,6 +53,7 @@ pub fn Blade(comptime sig: Signature, comptime Field: type) type {
         const Self = @This();
         const SelfMetric = Metric(sig);
         const SelfBasis = Basis(sig, Field);
+        const SelfMultivector = Multivector(sig, Field);
 
         /// bit i is true if the blade has basis vector i
         basis: u8,
@@ -85,6 +86,11 @@ pub fn Blade(comptime sig: Signature, comptime Field: type) type {
             }
         }
 
+        /// Convert to a dense multivector
+        pub fn toMV(self: Self) SelfMultivector {
+            return SelfMultivector.fromBlade(self);
+        }
+
         pub fn mul(self: Self, rhs: anytype) Self {
             const RhsType = @TypeOf(rhs);
             return switch (RhsType) {
@@ -113,7 +119,7 @@ pub fn Blade(comptime sig: Signature, comptime Field: type) type {
         }
 
         /// Add (returns Multivector; supports Blade, Multivector, scalar, and pointers)
-        pub fn add(self: Self, rhs: anytype) Multivector(sig, Field) {
+        pub fn add(self: Self, rhs: anytype) SelfMultivector {
             const RhsType = @TypeOf(rhs);
             const MV = Multivector(sig, Field);
             return switch (RhsType) {
@@ -297,6 +303,20 @@ pub fn Basis(comptime sig: Signature, comptime Field: type) BasisInstance(sig, F
     return .{};
 }
 
+/// Convenience function returning the Basis for a Clifford algebra with
+/// signature (p,q,z).
+///
+/// Arguments:
+///    p: number of basis unit vectors that square to 1
+///    q: number of basis unit vectors that square to -1
+///    z: number of basis unit vectors that sqaure to 0
+///
+/// Unit basis blades with magnitude 1.0
+/// Returns an instance with all 2^rank basis blades auto-generated
+pub fn Cl(p: u4, q: u4, z: u4) BasisInstance(.{ .positive = p, .negative = q, .zero = z }, f32) {
+    return .{};
+}
+
 /// Generate a type with the 2^rank unit blades
 pub fn BasisInstance(comptime sig: Signature, comptime Field: type) type {
     @setEvalBranchQuota(10000);
@@ -322,47 +342,65 @@ pub fn BasisInstance(comptime sig: Signature, comptime Field: type) type {
         break :blk defs;
     };
 
-    // Build struct fields for all possible blades
-    var fields: [num_blades + 2]std.builtin.Type.StructField = undefined;
+    // Persistent storage for Multivector type
+    const mv_type = Multivector(sig, Field);
+
+    // Build struct fields for all possible blades + Multivector type
+    var fields: [num_blades + 3]std.builtin.Type.StructField = undefined;
+    var i = 0;
 
     // Special fields
-    fields[0] = .{
+    fields[i] = .{
         .name = "zero",
         .type = Blade(sig, Field),
         .default_value_ptr = @ptrCast(&defaults[0]),
         .is_comptime = true,
         .alignment = @alignOf(Blade(sig, Field)),
     };
+    i += 1;
 
-    fields[1] = .{
+    fields[i] = .{
         .name = "pseudoscalar",
         .type = Blade(sig, Field),
         .default_value_ptr = @ptrCast(&defaults[1]),
         .is_comptime = true,
         .alignment = @alignOf(Blade(sig, Field)),
     };
+    i += 1;
 
-    fields[2] = .{
+    fields[i] = .{
         .name = "one",
         .type = Blade(sig, Field),
         .default_value_ptr = @ptrCast(&defaults[2]),
         .is_comptime = true,
         .alignment = @alignOf(Blade(sig, Field)),
     };
+    i += 1;
 
     // Generate all 2^rank blades
     inline for (1..num_blades) |signature| {
         const sig_u8: u8 = @intCast(signature);
         const name = signatureToName(sig_u8, rank);
 
-        fields[signature + 2] = .{
+        fields[i] = .{
             .name = name,
             .type = Blade(sig, Field),
-            .default_value_ptr = @ptrCast(&defaults[signature + 2]),
+            .default_value_ptr = @ptrCast(&defaults[i]),
             .is_comptime = true,
             .alignment = @alignOf(Blade(sig, Field)),
         };
+        i += 1;
     }
+
+    // Add Multivector type field
+    fields[i] = .{
+        .name = "Multivector",
+        .type = type,
+        .default_value_ptr = @ptrCast(&mv_type),
+        .is_comptime = true,
+        .alignment = @alignOf(type),
+    };
+    i += 1;
 
     return @Type(.{
         .@"struct" = .{
@@ -374,13 +412,13 @@ pub fn BasisInstance(comptime sig: Signature, comptime Field: type) type {
     });
 }
 
-pub const euclidean = Basis(.{ .positive = 8, .negative = 0, .zero = 0 }, f32);
-pub const euclidean3d = Basis(.{ .positive = 3, .negative = 0, .zero = 0 }, f32);
-pub const minkowski3d = Basis(.{ .positive = 3, .negative = 1, .zero = 0 }, f32);
-pub const projective2d = Basis(.{ .positive = 2, .negative = 0, .zero = 1 }, f32);
-pub const conformal2d = Basis(.{ .positive = 2, .negative = 1, .zero = 1 }, f32);
-pub const projective3d = Basis(.{ .positive = 3, .negative = 0, .zero = 1 }, f32);
-pub const conformal3d = Basis(.{ .positive = 3, .negative = 1, .zero = 1 }, f32);
+pub const euclidean = Cl(8, 0, 0);
+pub const euclidean3d = Cl(3, 0, 0);
+pub const minkowski3d = Cl(3, 1, 0);
+pub const projective2d = Cl(2, 0, 1);
+pub const conformal2d = Cl(2, 1, 1);
+pub const projective3d = Cl(3, 0, 1);
+pub const conformal3d = Cl(3, 1, 1);
 
 /// Test helper: check blade equality with diagnostic output on failure
 fn expectBladeEqual(result: anytype, expected: @TypeOf(result), tolerance: f32) !void {
@@ -506,68 +544,64 @@ test "Conformal: e40 * e40 = 0 (degenerate)" {
 }
 
 // Multivector tests
-const Euclidean3dMV = Multivector(.{ .positive = 3, .negative = 0, .zero = 0 }, f32);
-
 test "Multivector: addition" {
-    const a = Euclidean3dMV.fromBlade(euclidean3d.e0.mul(2.0));
-    const b = Euclidean3dMV.fromBlade(euclidean3d.e1.mul(3.0));
-    const result = a.add(b);
-    const expected = Euclidean3dMV{ .coefficients = .{ 0, 2, 3, 0, 0, 0, 0, 0 } };
+    const result = euclidean3d.e0.mul(2.0).add(euclidean3d.e1.mul(3.0));
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 0, 2, 3, 0, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: scalar multiplication" {
-    const a = Euclidean3dMV.fromBlade(euclidean3d.e0.mul(2.0));
+    const a = euclidean3d.e0.mul(2.0).toMV();
     const result = a.mul(3.0);
-    const expected = Euclidean3dMV{ .coefficients = .{ 0, 6, 0, 0, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 0, 6, 0, 0, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: grade select scalar" {
-    const mv = Euclidean3dMV{ .coefficients = .{ 5, 2, 3, 1, 0, 0, 0, 0 } };
+    const mv = euclidean3d.Multivector{ .coefficients = .{ 5, 2, 3, 1, 0, 0, 0, 0 } };
     const result = mv.selectGrade(0);
-    const expected = Euclidean3dMV{ .coefficients = .{ 5, 0, 0, 0, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 5, 0, 0, 0, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: grade select vectors" {
-    const mv = Euclidean3dMV{ .coefficients = .{ 5, 2, 3, 1, 0, 0, 0, 0 } };
+    const mv = euclidean3d.Multivector{ .coefficients = .{ 5, 2, 3, 1, 0, 0, 0, 0 } };
     const result = mv.selectGrade(1);
-    const expected = Euclidean3dMV{ .coefficients = .{ 0, 2, 3, 0, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 0, 2, 3, 0, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: geometric product matches blade product" {
-    const a = Euclidean3dMV{ .coefficients = .{ 0, 1, 0, 0, 0, 0, 0, 0 } }; // e0
-    const b = Euclidean3dMV{ .coefficients = .{ 0, 0, 1, 0, 0, 0, 0, 0 } }; // e1
+    const a = euclidean3d.e0.toMV();
+    const b = euclidean3d.e1.toMV();
     const result = a.mul(b);
     // e0 * e1 = -e10 (basis 3)
-    const expected = Euclidean3dMV{ .coefficients = .{ 0, 0, 0, -1, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 0, 0, 0, -1, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: (e0 + e1) * e2" {
-    const a = Euclidean3dMV{ .coefficients = .{ 0, 1, 1, 0, 0, 0, 0, 0 } }; // e0 + e1
+    const a = euclidean3d.e0.add(euclidean3d.e1);
     const result = a.mul(euclidean3d.e2);
     // e0 * e2 = -e20 (basis 5), e1 * e2 = -e21 (basis 6)
-    const expected = Euclidean3dMV{ .coefficients = .{ 0, 0, 0, 0, 0, -1, -1, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 0, 0, 0, 0, 0, -1, -1, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 test "Multivector: (2*e0 + 3*e1) * (4*e0 + 5*e1)" {
-    const a = Euclidean3dMV{ .coefficients = .{ 0, 2, 3, 0, 0, 0, 0, 0 } };
-    const b = Euclidean3dMV{ .coefficients = .{ 0, 4, 5, 0, 0, 0, 0, 0 } };
+    const a = euclidean3d.e0.mul(2.0).add(euclidean3d.e1.mul(3.0));
+    const b = euclidean3d.e0.mul(4.0).add(euclidean3d.e1.mul(5.0));
     const result = a.mul(b);
     // e0*e0 = 1, e1*e1 = 1 => scalar: 2*4 + 3*5 = 23
     // e0*e1 = -e10, e1*e0 = e10 => e10: -2*5 + 3*4 = 2
-    const expected = Euclidean3dMV{ .coefficients = .{ 23, 0, 0, 2, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 23, 0, 0, 2, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
 
 // Generic operation tests
 test "Multivector: add with scalar" {
-    const a = Euclidean3dMV{ .coefficients = .{ 0, 2, 0, 0, 0, 0, 0, 0 } };
+    const a = euclidean3d.e0.mul(2.0).toMV();
     const result = a.add(5.0);
-    const expected = Euclidean3dMV{ .coefficients = .{ 5, 2, 0, 0, 0, 0, 0, 0 } };
+    const expected = euclidean3d.Multivector{ .coefficients = .{ 5, 2, 0, 0, 0, 0, 0, 0 } };
     try expectMultivectorEqual(result, expected, 1e-6);
 }
