@@ -14,7 +14,7 @@ fn swaps(a: u8, b: u8, comptime rank: u8) u8 {
     return acc;
 }
 
-const Signature = struct {
+pub const Signature = struct {
     const Self = @This();
 
     positive: u8,
@@ -156,6 +156,36 @@ pub fn Multivector(comptime sig: Signature, comptime Field: type) type {
         const SelfBlade = Blade(sig, Field);
         const SelfMetric = Metric(sig);
 
+        /// Cayley table: cayley_signs[i][j] = sign for e_i * e_j
+        /// Result blade is e_(i^j)
+        const cayley_signs: [size]@Vector(size, Field) = blk: {
+            const metric = SelfMetric{};
+            var table: [size]@Vector(size, Field) = undefined;
+
+            for (0..size) |i| {
+                var row: [size]Field = undefined;
+                for (0..size) |j| {
+                    const sig_i: u8 = @intCast(i);
+                    const sig_j: u8 = @intCast(j);
+
+                    // Check if product is zero (squared degenerate vector)
+                    const squares: u8 = sig_i & sig_j;
+                    if ((squares & metric.zero) != 0) {
+                        row[j] = 0.0;
+                        continue;
+                    }
+
+                    // Compute sign from swaps and negative squares
+                    const swap_sign: Field = if ((swaps(sig_i, sig_j, rank) & 1) != 0) -1.0 else 1.0;
+                    const metric_sign: Field = if ((@popCount(squares & metric.negative) & 1) != 0) -1.0 else 1.0;
+
+                    row[j] = swap_sign * metric_sign;
+                }
+                table[i] = row;
+            }
+            break :blk table;
+        };
+
         /// Dense array of coefficients indexed by signature.
         /// coefficients[i] = coefficient for blade with signature i
         coefficients: @Vector(size, Field),
@@ -227,35 +257,28 @@ pub fn Multivector(comptime sig: Signature, comptime Field: type) type {
                 },
                 Self => blk: {
                     var result = zero();
-                    const metric = SelfMetric{};
 
-                    // Direct computation: multiply each pair of basis blades
-                    for (0..size) |i| {
-                        const sig_i: u8 = @intCast(i);
-                        const a_coef = self.coefficients[i];
-                        if (a_coef == 0.0) continue;
-
-                        for (0..size) |j| {
-                            const sig_j: u8 = @intCast(j);
-                            const b_coef = rhs.coefficients[j];
-                            if (b_coef == 0.0) continue;
-
-                            // Check if product is zero (squared degenerate vector)
-                            const squares: u8 = sig_i & sig_j;
-                            if ((squares & metric.zero) != 0) {
-                                continue;
+                    // Vectorized multiplication using Cayley table
+                    // For each output coefficient k:
+                    //   result[k] = sum_j (self[k^j] * cayley_signs[k][j] * rhs[j])
+                    inline for (0..size) |k| {
+                        // Generate gather indices: k^j for j in 0..size
+                        const indices = comptime blk2: {
+                            var idx: [size]i32 = undefined;
+                            for (0..size) |j| {
+                                idx[j] = @intCast(k ^ j);
                             }
+                            break :blk2 idx;
+                        };
 
-                            // Compute sign from swaps and negative squares
-                            const swap_sign: Field = if ((swaps(sig_i, sig_j, rank) & 1) != 0) -1.0 else 1.0;
-                            const metric_sign: Field = if ((@popCount(squares & metric.negative) & 1) != 0) -1.0 else 1.0;
+                        // Gather self[k^j] for all j
+                        const gathered = @shuffle(Field, self.coefficients, undefined, indices);
 
-                            // Result signature and magnitude
-                            const result_sig = sig_i ^ sig_j;
-                            const magnitude = a_coef * b_coef * swap_sign * metric_sign;
+                        // Multiply by Cayley signs for row k
+                        const row_k = gathered * cayley_signs[k];
 
-                            result.coefficients[result_sig] += magnitude;
-                        }
+                        // Dot product with rhs
+                        result.coefficients[k] = @reduce(.Add, row_k * rhs.coefficients);
                     }
 
                     break :blk result;

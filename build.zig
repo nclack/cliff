@@ -26,6 +26,22 @@ pub fn build(b: *std.Build) void {
     });
     run_tests.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    // DSL module
+    const dsl_module = b.createModule(.{
+        .root_source_file = b.path("src/dsl.zig"),
+        .target = target,
+    });
+
+    // DSL unit tests
+    const dsl_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dsl.zig"),
+            .target = target,
+        }),
+    });
+    dsl_tests.root_module.addImport("cliff", lib.root_module);
+    run_tests.dependOn(&b.addRunArtifact(dsl_tests).step);
+
     // Integration tests
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -34,5 +50,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     integration_tests.root_module.addImport("cliff", lib.root_module);
+    integration_tests.root_module.addImport("dsl", dsl_module);
     run_tests.dependOn(&b.addRunArtifact(integration_tests).step);
 }
