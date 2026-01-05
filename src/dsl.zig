@@ -1,68 +1,25 @@
 const std = @import("std");
 const cliff = @import("cliff");
 
-const Range = struct {
-    const Self = @This();
-
-    beg: [*]const u8,
-    end: [*]const u8,
-
-    fn from_slice(slc: []const u8) Self {
-        return .{
-            .beg = slc.ptr,
-            .end = slc.ptr + slc.len,
-        };
-    }
-
-    fn to_slice(self: Self) []const u8 {
-        return self.beg[0..self.len()];
-    }
-
-    fn len(self: Self) usize {
-        return @intFromPtr(self.end) - @intFromPtr(self.beg);
-    }
-
-    fn asUtf8Iterator(self: Self) std.unicode.Utf8Iterator {
-        return .{ .bytes = self.to_slice(), .i = 0 };
-    }
-
-    fn to(self: Self, i: usize) Range {
-        return Range{ .beg = self.beg, .end = self.beg + i };
-    }
-
-    fn from(self: Self, i: usize) Range {
-        return Range{ .beg = self.beg + i, .end = self.end };
-    }
-
-    fn split(self: Self, i: usize) [2]Range {
-        return .{ self.to(i), self.from(i) };
-    }
-};
-
 fn ParseResult(T: type) type {
     return struct {
         match: T,
-        rest: Range,
+        rest: []const u8,
     };
-}
-
-fn mkParseResultWithSplit(input: Range, i: usize) ParseResult(Range) {
-    const parts = input.split(i);
-    return .{ .match = parts[0], .rest = parts[1] };
 }
 
 /// Creates a Parser type from a compile-time closure.
 ///
 /// Contract:
 /// - `args`: Any compile-time value to capture (e.g., a predicate function, a string, etc.)
-/// - `func`: A function with signature `fn(Range, @TypeOf(args)) ?ParseResult(T)` for some type T
+/// - `func`: A function with signature `fn([]const u8, @TypeOf(args)) ?ParseResult(T)` for some type T
 ///
-/// The returned Parser type has a `parse(Range)` method that returns `?ParseResult(T)`.
+/// The returned Parser type has a `parse([]const u8)` method that returns `?ParseResult(T)`.
 ///
 /// Example:
 ///   ```zig
 ///   const my_parser = Parser("hello", struct {
-///       fn parse(input: Range, target: []const u8) ?ParseResult(Range) {
+///       fn parse(input: []const u8, target: []const u8) ?ParseResult([]const u8) {
 ///           // ... parsing logic ...
 ///       }
 ///   }.parse);
@@ -114,7 +71,7 @@ fn Parser(comptime args: anytype, comptime func: anytype) type {
     return struct {
         const Self = @This();
 
-        fn parse(input: Range) ReturnType {
+        fn parse(input: []const u8) ReturnType {
             return func(input, args);
         }
     };
@@ -126,9 +83,9 @@ fn Parser(comptime args: anytype, comptime func: anytype) type {
 /// NOTE: zig decodes utf-8 codepoints to u21.
 fn take_while(predicate: fn (u21) bool) type {
     return Parser(predicate, struct {
-        fn parse(input: Range, predicate_: fn (u21) bool) ?ParseResult(Range) {
+        fn parse(input: []const u8, predicate_: fn (u21) bool) ?ParseResult([]const u8) {
             var last_match_pos: ?usize = null;
-            var it = input.asUtf8Iterator();
+            var it = std.unicode.Utf8Iterator{ .bytes = input, .i = 0 };
             while (it.nextCodepoint()) |codepoint| {
                 if (predicate_(codepoint)) {
                     // it.i points past the consumed bytes
@@ -137,23 +94,29 @@ fn take_while(predicate: fn (u21) bool) type {
                     break;
                 }
             }
-            return if (last_match_pos) |i| mkParseResultWithSplit(input, i) else null;
+            return if (last_match_pos) |i|
+                .{ .match = input[0..i], .rest = input[i..] }
+            else
+                null;
         }
     }.parse);
 }
 
 fn take_one(predicate: fn (u21) bool) type {
     return Parser(predicate, struct {
-        fn parse(input: Range, predicate_: fn (u21) bool) ?ParseResult(Range) {
+        fn parse(input: []const u8, predicate_: fn (u21) bool) ?ParseResult([]const u8) {
             var last_match_pos: ?usize = null;
-            var it = input.asUtf8Iterator();
+            var it = std.unicode.Utf8Iterator{ .bytes = input, .i = 0 };
             if (it.nextCodepoint()) |codepoint| {
                 if (predicate_(codepoint)) {
                     // it.i points past the consumed bytes
                     last_match_pos = it.i;
                 }
             }
-            return if (last_match_pos) |i| mkParseResultWithSplit(input, i) else null;
+            return if (last_match_pos) |i|
+                .{ .match = input[0..i], .rest = input[i..] }
+            else
+                null;
         }
     }.parse);
 }
@@ -176,12 +139,11 @@ const digits = take_while(isDigit);
 /// Returns a Parser that matches the given target string.
 fn tag(target: []const u8) type {
     return Parser(target, struct {
-        fn parse(input: Range, target_: []const u8) ?ParseResult(Range) {
+        fn parse(input: []const u8, target_: []const u8) ?ParseResult([]const u8) {
             // This works for utf-8 since we're just comparing byte slices.
-            if (input.len() >= target_.len) {
-                const input_slice = input.to_slice()[0..target_.len];
-                if (std.mem.eql(u8, input_slice, target_)) {
-                    return mkParseResultWithSplit(input, target_.len);
+            if (input.len >= target_.len) {
+                if (std.mem.eql(u8, input[0..target_.len], target_)) {
+                    return .{ .match = input[0..target_.len], .rest = input[target_.len..] };
                 }
             }
             return null;
@@ -205,7 +167,7 @@ fn opt(comptime parser: type) type {
     }
 
     return Parser(parser, struct {
-        fn parse(input: Range, parser_: type) ?ParseResult(?match_type) {
+        fn parse(input: []const u8, parser_: type) ?ParseResult(?match_type) {
             if (parser_.parse(input)) |result| {
                 return .{
                     .match = result.match,
@@ -221,7 +183,7 @@ fn opt(comptime parser: type) type {
 /// Returns a Parser that tests a list of parsers until one succeeds.
 /// All parsers must return ?ParseResult(T) for the same type T.
 ///
-/// Example: `alt(Range, .{ tag("hello"), tag("goodbye") })`
+/// Example: `alt([]const u8, .{ tag("hello"), tag("goodbye") })`
 fn alt(comptime T: type, comptime parsers: anytype) type {
     const parsers_type_info = @typeInfo(@TypeOf(parsers));
 
@@ -248,7 +210,7 @@ fn alt(comptime T: type, comptime parsers: anytype) type {
     };
 
     return Parser(parser_types, struct {
-        fn parse(input: Range, ps: @TypeOf(parser_types)) ?ParseResult(T) {
+        fn parse(input: []const u8, ps: @TypeOf(parser_types)) ?ParseResult(T) {
             inline for (ps) |ParserType| {
                 if (ParserType.parse(input)) |result| {
                     return result;
@@ -310,7 +272,7 @@ fn seq(comptime parsers: anytype) type {
     const TupleType = std.meta.Tuple(&match_types);
 
     return Parser(parser_types, struct {
-        fn parse(input: Range, ps: @TypeOf(parser_types)) ?ParseResult(TupleType) {
+        fn parse(input: []const u8, ps: @TypeOf(parser_types)) ?ParseResult(TupleType) {
             var current = input;
             var results: TupleType = undefined;
 
@@ -331,11 +293,11 @@ fn seq(comptime parsers: anytype) type {
 /// If the child parser was successful, return the consumed input as produced value.
 fn recognize(comptime parser: type) type {
     return Parser(parser, struct {
-        fn parse(input: Range, parser_: type) ?ParseResult(Range) {
+        fn parse(input: []const u8, parser_: type) ?ParseResult([]const u8) {
             const result = parser_.parse(input) orelse return null;
-            const consumed = @intFromPtr(result.rest.beg) - @intFromPtr(input.beg);
+            const consumed = input.len - result.rest.len;
             return .{
-                .match = input.to(consumed),
+                .match = input[0..consumed],
                 .rest = result.rest,
             };
         }
@@ -344,7 +306,7 @@ fn recognize(comptime parser: type) type {
 
 const number = recognize(seq(.{
     opt(tag("-")), // optional sign
-    alt(Range, .{ tag("0"), digits }), // integer part ('0' or 1+ digits)
+    alt([]const u8, .{ tag("0"), digits }), // integer part ('0' or 1+ digits)
     opt(seq(.{ tag("."), digits })), // decimal part
     opt(seq(.{ tag("e"), opt(tag("-")), digits })), // optional exponent
 }));
@@ -783,87 +745,87 @@ test "parse: error on invalid token" {
 
 test "tag parser: match" {
     const input_data = "hello world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = tag("hello").parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("hello", result.?.match.to_slice());
-    try std.testing.expectEqualStrings(" world", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.match);
+    try std.testing.expectEqualStrings(" world", result.?.rest);
 }
 
 test "tag parser: no match" {
     const input_data = "hello world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = tag("goodbye").parse(input);
     try std.testing.expect(result == null);
 }
 
 test "opt combinator: successful parse" {
     const input_data = "   hello";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const maybe_ws = opt(whitespace);
     const result = maybe_ws.parse(input);
     try std.testing.expect(result != null);
     // Should have consumed the whitespace
-    try std.testing.expectEqualStrings("   ", result.?.match.?.to_slice());
-    try std.testing.expectEqualStrings("hello", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("   ", result.?.match.?);
+    try std.testing.expectEqualStrings("hello", result.?.rest);
 }
 
 test "opt combinator: failed parse still succeeds" {
     const input_data = "hello";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const maybe_ws = opt(whitespace);
     const result = maybe_ws.parse(input);
     try std.testing.expect(result != null);
     // Should not have consumed anything (empty match)
     try std.testing.expectEqual(null, result.?.match);
-    try std.testing.expectEqualStrings("hello", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.rest);
 }
 
 test "alt combinator: first parser matches" {
     const input_data = "hello world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
-    const parser = alt(Range, .{ tag("hello"), tag("goodbye") });
+    const input = input_data;
+    const parser = alt([]const u8, .{ tag("hello"), tag("goodbye") });
     const result = parser.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("hello", result.?.match.to_slice());
-    try std.testing.expectEqualStrings(" world", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.match);
+    try std.testing.expectEqualStrings(" world", result.?.rest);
 }
 
 test "alt combinator: second parser matches" {
     const input_data = "goodbye world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
-    const parser = alt(Range, .{ tag("hello"), tag("goodbye") });
+    const input = input_data;
+    const parser = alt([]const u8, .{ tag("hello"), tag("goodbye") });
     const result = parser.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("goodbye", result.?.match.to_slice());
-    try std.testing.expectEqualStrings(" world", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("goodbye", result.?.match);
+    try std.testing.expectEqualStrings(" world", result.?.rest);
 }
 
 test "alt combinator: no match" {
     const input_data = "other world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
-    const parser = alt(Range, .{ tag("hello"), tag("goodbye") });
+    const input = input_data;
+    const parser = alt([]const u8, .{ tag("hello"), tag("goodbye") });
     const result = parser.parse(input);
     try std.testing.expect(result == null);
 }
 
 test "seq combinator: all parsers match" {
     const input_data = "hello world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = seq(.{ tag("hello"), whitespace, tag("world") });
     const result = parser.parse(input);
     try std.testing.expect(result != null);
     // Check tuple elements
-    try std.testing.expectEqualStrings("hello", result.?.match[0].to_slice());
-    try std.testing.expectEqualStrings(" ", result.?.match[1].to_slice());
-    try std.testing.expectEqualStrings("world", result.?.match[2].to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.match[0]);
+    try std.testing.expectEqualStrings(" ", result.?.match[1]);
+    try std.testing.expectEqualStrings("world", result.?.match[2]);
     // Check rest is empty
-    try std.testing.expectEqualStrings("", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("", result.?.rest);
 }
 
 test "seq combinator: first parser fails" {
     const input_data = "goodbye world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = seq(.{ tag("hello"), whitespace, tag("world") });
     const result = parser.parse(input);
     try std.testing.expect(result == null);
@@ -871,7 +833,7 @@ test "seq combinator: first parser fails" {
 
 test "seq combinator: middle parser fails" {
     const input_data = "helloworld";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = seq(.{ tag("hello"), whitespace, tag("world") });
     const result = parser.parse(input);
     try std.testing.expect(result == null);
@@ -879,7 +841,7 @@ test "seq combinator: middle parser fails" {
 
 test "seq combinator: last parser fails" {
     const input_data = "hello goodbye";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = seq(.{ tag("hello"), whitespace, tag("world") });
     const result = parser.parse(input);
     try std.testing.expect(result == null);
@@ -887,37 +849,37 @@ test "seq combinator: last parser fails" {
 
 test "seq combinator: single parser" {
     const input_data = "hello";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = seq(.{tag("hello")});
     const result = parser.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("hello", result.?.match[0].to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.match[0]);
 }
 
 test "recognize combinator: captures consumed input" {
     const input_data = "hello world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = recognize(seq(.{ tag("hello"), whitespace, tag("world") }));
     const result = parser.parse(input);
     try std.testing.expect(result != null);
     // Should return the entire matched input as a Range
-    try std.testing.expectEqualStrings("hello world", result.?.match.to_slice());
-    try std.testing.expectEqualStrings("", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("hello world", result.?.match);
+    try std.testing.expectEqualStrings("", result.?.rest);
 }
 
 test "recognize combinator: partial match" {
     const input_data = "hello foo";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = recognize(tag("hello"));
     const result = parser.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("hello", result.?.match.to_slice());
-    try std.testing.expectEqualStrings(" foo", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("hello", result.?.match);
+    try std.testing.expectEqualStrings(" foo", result.?.rest);
 }
 
 test "recognize combinator: no match" {
     const input_data = "goodbye world";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const parser = recognize(tag("hello"));
     const result = parser.parse(input);
     try std.testing.expect(result == null);
@@ -925,73 +887,71 @@ test "recognize combinator: no match" {
 
 test "number: positive integer" {
     const input_data = "123";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("123", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("123", result.?.match);
 }
 
 test "number: negative integer" {
     const input_data = "-456";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("-456", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("-456", result.?.match);
 }
 
 test "number: decimal" {
     const input_data = "3.14";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("3.14", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("3.14", result.?.match);
 }
 
 test "number: with exponent" {
     const input_data = "1e10";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("1e10", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("1e10", result.?.match);
 }
 
 test "number: with negative exponent" {
     const input_data = "1e-5";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("1e-5", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("1e-5", result.?.match);
 }
 
 test "number: single digit" {
     const input_data = "5";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("5", result.?.match.to_slice());
+    try std.testing.expectEqualStrings("5", result.?.match);
 }
 
 test "number: partial match with remainder" {
     const input_data = "42 hello";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("42", result.?.match.to_slice());
-    try std.testing.expectEqualStrings(" hello", result.?.rest.to_slice());
+    try std.testing.expectEqualStrings("42", result.?.match);
+    try std.testing.expectEqualStrings(" hello", result.?.rest);
 }
 
 test "number: not a number" {
     const input_data = "hello";
-    const input = Range{ .beg = input_data.ptr, .end = input_data.ptr + input_data.len };
+    const input = input_data;
     const result = number.parse(input);
     try std.testing.expect(result == null);
 }
 
-
 // Demonstrate compile-time parsing validation
 fn isValidNumber(comptime str: []const u8) bool {
-    const input = Range{ .beg = str.ptr, .end = str.ptr + str.len };
-    const result = number.parse(input);
+    const result = number.parse(str);
     return result != null;
 }
 

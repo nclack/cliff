@@ -2,8 +2,8 @@
 
 ## 2026-01-04
 
-I am still working on parser combinators in zig for comptime expression
-evaluation. It's still a pleasure working with Zig :)
+I am working on parser combinators in zig for comptime expression evaluation.
+It's still a pleasure working with Zig :)
 
 The way I've found to develop a parser lbrary this way is to start with very
 simple forms, like:
@@ -146,6 +146,19 @@ const number = recognize(seq(.{
     opt(seq(.{ tag("."), digits })), // decimal part
     opt(seq(.{ tag("e"), opt(tag("-")), digits })), // optional exponent
 }));
+```
+
+And I can evaluate it at comptime.
+
+```zig
+test "comptime number validation" {
+    // Checks happen entirely at compile time!
+    comptime {
+        if (!isValidNumber("123.45")) {
+            @compileError("123.45 should be a valid number");
+        }
+    }
+}
 ```
 
 TODO
