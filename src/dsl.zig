@@ -133,7 +133,22 @@ fn isDigit(codepoint: u21) bool {
     return std.ascii.isDigit(@truncate(codepoint));
 }
 
+fn isAlpha(codepoint: u21) bool {
+    // This works because any non-ascii character will have the most
+    // significant bit set in the low byte.
+    return std.ascii.isAlphabetic(@truncate(codepoint));
+}
+
+fn isAlphanumeric(codepoint: u21) bool {
+    // This works because any non-ascii character will have the most
+    // significant bit set in the low byte.
+    return std.ascii.isAlphanumeric(@truncate(codepoint));
+}
+
 const whitespace = take_while(isWhitespace);
+const whitespace0 = opt(whitespace);
+const alphanumeric = take_while(isAlphanumeric);
+const alphanumeric0 = opt(alphanumeric);
 const digits = take_while(isDigit);
 
 /// Returns a Parser that matches the given target string.
@@ -311,18 +326,195 @@ const number = recognize(seq(.{
     opt(seq(.{ tag("e"), opt(tag("-")), digits })), // optional exponent
 }));
 
-// TODO: convert below to using a std.unicode.Utf8Iterator internally
+/// Maps the match type for the parser
+fn map(comptime mapfn: anytype, comptime parser: type) type {
+    // 1. Extract the match type from the parser
+    const parse_return_type = @typeInfo(@TypeOf(parser.parse)).@"fn".return_type.?;
+    const parse_result_type = @typeInfo(parse_return_type).optional.child;
+    const fields = @typeInfo(parse_result_type).@"struct".fields;
+    comptime var match_type: type = undefined;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "match")) {
+            match_type = field.type;
+            break;
+        }
+    }
 
-/// Token types for the DSL
+    // 2. Validate and extract mapfn information
+    const mapfn_info = @typeInfo(@TypeOf(mapfn));
+    if (mapfn_info != .@"fn") {
+        @compileError("map expects a function");
+    }
+
+    const params = mapfn_info.@"fn".params;
+    if (params.len != 1) {
+        @compileError("map function must have exactly 1 parameter");
+    }
+
+    const param_type = params[0].type.?;
+    if (param_type != match_type) {
+        @compileError("map function parameter type must match parser match type");
+    }
+
+    const MappedType = mapfn_info.@"fn".return_type.?;
+
+    // 3. Create and return the mapped parser
+    return Parser(.{ .parser = parser, .mapfn = mapfn }, struct {
+        fn parse(input: []const u8, ctx: anytype) ?ParseResult(MappedType) {
+            const result = ctx.parser.parse(input) orelse return null;
+            return .{
+                .match = ctx.mapfn(result.match),
+                .rest = result.rest,
+            };
+        }
+    }.parse);
+}
+
+/// Matches the input parser 1 or more times, returning an array of matches.
+/// Fails if the parser doesn't match at least once.
+/// Comptime-only (builds the array during compilation).
+fn many(comptime parser: type) type {
+    // Extract the match type from the parser
+    const parse_return_type = @typeInfo(@TypeOf(parser.parse)).@"fn".return_type.?;
+    const parse_result_type = @typeInfo(parse_return_type).optional.child;
+    const fields = @typeInfo(parse_result_type).@"struct".fields;
+    comptime var match_type: type = undefined;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "match")) {
+            match_type = field.type;
+            break;
+        }
+    }
+
+    return Parser(parser, struct {
+        fn parse(input: []const u8, parser_: type) ?ParseResult([]const match_type) {
+            var results: []const match_type = &.{};
+            var current = input;
+            var iterations: usize = 0;
+            const max_iterations = 1000;
+
+            while (iterations < max_iterations) : (iterations += 1) {
+                if (parser_.parse(current)) |result| {
+                    results = results ++ &[_]match_type{result.match};
+                    current = result.rest;
+                } else {
+                    break;
+                }
+            }
+
+            // Require at least one match
+            if (results.len == 0) {
+                return null;
+            }
+
+            return .{
+                .match = results,
+                .rest = current,
+            };
+        }
+    }.parse);
+}
+
+/// Returns the provided value if the child parser succeeds.
+fn value(comptime val: anytype, comptime parser: type) type {
+    return Parser(.{ .parser = parser, .value = val }, struct {
+        fn parse(input: []const u8, ctx: anytype) ?ParseResult(@TypeOf(val)) {
+            const result = ctx.parser.parse(input) orelse return null;
+            return .{
+                .match = val,
+                .rest = result.rest,
+            };
+        }
+    }.parse);
+}
+
+// FIXME: delimited, terminated, preceded could probably be written as a map(seq(...))
+
+/// Matches an object from the first parser and discards it, then gets an object
+/// from the second parser, and finally matches an object from the third parser
+/// and discards it.
+fn delimited(comptime FirstParser: type, comptime SecondParser: type, comptime ThirdParser: type) type {
+
+    // 1. Extract the match type from the SecondParser
+    const parse_return_type = @typeInfo(@TypeOf(SecondParser.parse)).@"fn".return_type.?;
+    const parse_result_type = @typeInfo(parse_return_type).optional.child;
+    const fields = @typeInfo(parse_result_type).@"struct".fields;
+    comptime var match_type: type = undefined;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "match")) {
+            match_type = field.type;
+            break;
+        }
+    }
+
+    // 2. Make the parser
+    return Parser(.{ FirstParser, SecondParser, ThirdParser }, struct {
+        fn parse(input: []const u8, ctx: anytype) ?ParseResult(match_type) {
+            const result = seq(ctx).parse(input) orelse return null;
+            return .{
+                .match = result.match[1],
+                .rest = result.rest,
+            };
+        }
+    }.parse);
+}
+
+/// Gets an object from the Value parser, and matches an object from the
+/// Terminator parser and discards it.
+fn terminated(comptime ValueParser: type, comptime TerminatorParser: type) type {
+
+    // 1. Extract the match type from the SecondParser
+    const parse_return_type = @typeInfo(@TypeOf(ValueParser.parse)).@"fn".return_type.?;
+    const parse_result_type = @typeInfo(parse_return_type).optional.child;
+    const fields = @typeInfo(parse_result_type).@"struct".fields;
+    comptime var match_type: type = undefined;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "match")) {
+            match_type = field.type;
+            break;
+        }
+    }
+
+    // 2. Make the parser
+    return Parser(.{ ValueParser, TerminatorParser }, struct {
+        fn parse(input: []const u8, ctx: anytype) ?ParseResult(match_type) {
+            const result = seq(ctx).parse(input) orelse return null;
+            return .{
+                .match = result.match[0],
+                .rest = result.rest,
+            };
+        }
+    }.parse);
+}
+
+// === Expression language: arithmetic expressions - Tokenizer ===
+
+/// Token types for arithmetic expressions
 pub const TokenType = enum {
     NUMBER,
+    IDENTIFIER,
     PLUS,
+    MINUS,
     STAR,
     LPAREN,
     RPAREN,
     EOF,
     INVALID,
 };
+
+const identifier = recognize(seq(.{ take_one(isAlpha), alphanumeric0 }));
+
+const tokens = many(delimited(whitespace0, alt(.{
+    value(TokenType.NUMBER, number),
+    value(TokenType.IDENTIFIER, identifier),
+    value(TokenType.PLUS, tag("+")),
+    value(TokenType.MINUS, tag("-")),
+    value(TokenType.STAR, tag("*")),
+    value(TokenType.LPAREN, tag("(")),
+    value(TokenType.RPAREN, tag(")")),
+}), whitespace0));
+
+// === TODO: convert below to use parser combinators. ===
 
 /// A token with position information
 pub const Token = struct {
@@ -514,13 +706,13 @@ const OldParser = struct {
             .NUMBER => {
                 self.advance();
                 // Parse the float value here in the parser
-                const value = std.fmt.parseFloat(f32, tok.lexeme) catch {
+                const val = std.fmt.parseFloat(f32, tok.lexeme) catch {
                     return OldParseError{
                         .message = "Invalid number format",
                         .pos = tok.pos,
                     };
                 };
-                nodes.* = nodes.* ++ &[_]ASTNode{.{ .Scalar = value }};
+                nodes.* = nodes.* ++ &[_]ASTNode{.{ .Scalar = val }};
                 return null;
             },
             .LPAREN => {
@@ -591,10 +783,10 @@ pub fn parse(comptime tokens: []const Token) OldParseResult {
 /// Evaluate an AST node to a Multivector
 fn evaluateNode(comptime BasisType: type, comptime node: ASTNode, vars: anytype) BasisType.Multivector {
     switch (node) {
-        .Scalar => |value| {
+        .Scalar => |val| {
             // Value is already parsed by the parser
             var result = BasisType.Multivector.zero();
-            result.coefficients[0] = value;
+            result.coefficients[0] = val;
             return result;
         },
         .BinOp => |binop| {
@@ -972,6 +1164,78 @@ test "comptime number validation" {
         }
         if (isValidNumber("")) {
             @compileError("empty string should NOT be a valid number");
+        }
+    }
+}
+
+test "map: parse number string to f32" {
+    const parseFloat = struct {
+        fn f(s: []const u8) f32 {
+            return std.fmt.parseFloat(f32, s) catch 0.0;
+        }
+    }.f;
+
+    const float_parser = map(parseFloat, number);
+    const result = float_parser.parse("123.45 hello");
+
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(123.45, result.?.match);
+    try std.testing.expectEqualStrings(" hello", result.?.rest);
+}
+
+test "map: transform string to length at compile time" {
+    const getLength = struct {
+        fn f(s: []const u8) usize {
+            return s.len;
+        }
+    }.f;
+
+    comptime {
+        const length_parser = map(getLength, tag("hello"));
+        if (length_parser.parse("hello world").?.match != 5) {
+            @compileError("Expected a string length of 5");
+        }
+    }
+}
+
+test "value: identify a token" {
+    const TestToken = enum { NUM };
+    const result = value(TestToken.NUM, number).parse("123.45 hello");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(TestToken.NUM, result.?.match);
+    try std.testing.expectEqualStrings(" hello", result.?.rest);
+}
+
+test "delimited: parenthesis aroudn a number" {
+    const result = delimited(tag("("), number, tag(")")).parse("(42)more");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("42", result.?.match);
+    try std.testing.expectEqualStrings("more", result.?.rest);
+}
+
+test "many: comma-separated numbers" {
+    const parser = many(terminated(number, opt(tag(","))));
+    const input_data = "1,2,3,4 rest";
+    const input = input_data;
+    comptime {
+        const result = parser.parse(input);
+        if (result == null) {
+            @compileError("Expected successful parse");
+        }
+        if (result.?.match.len != 4) {
+            @compileError("Expected 4 matches");
+        }
+    }
+}
+
+test "many: fails when no matches" {
+    const parser = many(tag("hello"));
+    const input_data = "goodbye";
+    const input = input_data;
+    comptime {
+        const result = parser.parse(input);
+        if (result != null) {
+            @compileError("Expected parse to fail");
         }
     }
 }

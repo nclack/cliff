@@ -2,11 +2,18 @@
 
 ## 2026-01-04
 
+### Parser combinators for comptime
+
 I am working on parser combinators in zig for comptime expression evaluation.
 It's still a pleasure working with Zig :)
 
 The way I've found to develop a parser lbrary this way is to start with very
-simple forms, like:
+simple forms. I'll write the code for some of the basic functions we want and
+then as I need something new, I'll go back and refactor. Depending on the
+language, I might end up doing things in different ways. For `zig`, it looks
+like I can do parsers that are evaluable at `comptime`, which is crazy.
+
+I like starting with:
 
 ```zig
 fn take_while(input: []const u8, fn pred(input:[]const u8) bool) ?[]const u8
@@ -35,9 +42,8 @@ struct ParseResult {
 };
 ```
 
-But pretty quickly after that, we want a way to combine parsers so we can
-handle the matches. So how do we do that? Notice, all the parsing functions
-take a similar form:
+Next, we'll want a way to combine parsers so we can handle the matches. So how
+do we do that? Notice, all the parsing functions take a similar form:
 
 ```zig
 fn (input:[]const u8, ...parameters...) ParseResult;
@@ -161,9 +167,39 @@ test "comptime number validation" {
 }
 ```
 
-TODO
+### Back to arithmetic expressions
 
+Can write the tokenizer like so:
 
+```zig
+const identifier = recognize(seq(.{ take_one(isAlpha), alphanumeric0 }));
+
+const tokens = many(delimited(whitespace0, alt(.{
+    value(TokenType.NUMBER, number),
+    value(TokenType.IDENTIFIER, identifier),
+    value(TokenType.PLUS, tag("+")),
+    value(TokenType.MINUS, tag("-")),
+    value(TokenType.STAR, tag("*")),
+    value(TokenType.LPAREN, tag("(")),
+    value(TokenType.RPAREN, tag(")")),
+}), whitespace0));
+```
+
+The `many()` combinator is a bit tricky. It relies on comptime-only
+accumulation of results. I need to look into alternatives since it would be
+nice if I could use the same function for both runtime and comptime. At
+runtime, it's probably possible to pass the allocator in with the parser
+context.
+
+Really the tokens should get mapped to a richer token type that retains the
+matched slice.
+
+This will produce an array of tokens. It would be nice to be able to reuse
+the combinators to build parsers that work on top of the token stream to
+ultimately build the AST.
+
+Building the AST is another kind of accumulating construction, so I may
+want a "fold" kind of method.
 
 
 ## 2026-01-02
