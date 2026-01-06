@@ -41,7 +41,7 @@ fn Parser(comptime args: anytype, comptime func: anytype) type {
         else => @compileError("Expected function or function pointer"),
     };
 
-    // compile-time type validation
+    // type validation
     comptime {
         // Check it's an optional
         const type_info = @typeInfo(ReturnType);
