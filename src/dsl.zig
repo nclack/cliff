@@ -200,6 +200,9 @@ fn opt(comptime parser: type) type {
 ///
 /// Example: `alt([]const u8, .{ tag("hello"), tag("goodbye") })`
 fn alt(comptime T: type, comptime parsers: anytype) type {
+
+    // TODO: Just extract the match type from the first parser, and encorce that all parsers have the same match type
+
     const parsers_type_info = @typeInfo(@TypeOf(parsers));
 
     // Convert tuple to array of types
@@ -498,86 +501,55 @@ pub const TokenType = enum {
     STAR,
     LPAREN,
     RPAREN,
-    EOF,
     INVALID,
 };
 
+const Token = struct {
+    type: TokenType,
+    lexeme: []const u8,
+};
+
+fn mk_token(comptime kind: TokenType) fn ([]const u8) Token {
+    return struct {
+        fn inner(lexeme: []const u8) Token {
+            return .{ .type = kind, .lexeme = lexeme };
+        }
+    }.inner;
+}
+
 const identifier = recognize(seq(.{ take_one(isAlpha), alphanumeric0 }));
 
-const tokens = many(delimited(whitespace0, alt(.{
-    value(TokenType.NUMBER, number),
-    value(TokenType.IDENTIFIER, identifier),
-    value(TokenType.PLUS, tag("+")),
-    value(TokenType.MINUS, tag("-")),
-    value(TokenType.STAR, tag("*")),
-    value(TokenType.LPAREN, tag("(")),
-    value(TokenType.RPAREN, tag(")")),
+const tokenize = many(delimited(whitespace0, alt(Token, .{
+    map(mk_token(TokenType.NUMBER), number),
+    map(mk_token(TokenType.NUMBER), number),
+    map(mk_token(TokenType.IDENTIFIER), identifier),
+    map(mk_token(TokenType.PLUS), tag("+")),
+    map(mk_token(TokenType.MINUS), tag("-")),
+    map(mk_token(TokenType.STAR), tag("*")),
+    map(mk_token(TokenType.LPAREN), tag("(")),
+    map(mk_token(TokenType.RPAREN), tag(")")),
+    // Invalid tokens
+    // Try to consume any non-alphanumeric characters first.
+    // If that doesn't work then just take everything up to
+    // the next whitespace
+    map(mk_token(TokenType.INVALID), take_while(struct {
+        fn inner(codepoint: u21) bool {
+            return !(isAlphanumeric(codepoint) or isWhitespace(codepoint));
+        }
+    }.inner)),
+    map(mk_token(TokenType.INVALID), take_while(struct {
+        fn inner(codepoint: u21) bool {
+            return !isWhitespace(codepoint);
+        }
+    }.inner)),
 }), whitespace0));
 
 // === TODO: convert below to use parser combinators. ===
 
 /// A token with position information
-pub const Token = struct {
-    type: TokenType,
-    /// String slice from the original input (for NUMBER) or error message (for INVALID)
-    lexeme: []const u8,
-    /// Position in the input string
-    pos: usize,
-};
-
-/// Tokenize input at comptime
-pub fn tokenize(comptime input: []const u8) []const Token {
-    comptime {
-        var tokens: []const Token = &.{};
-        var pos: usize = 0;
-
-        while (pos < input.len) {
-            // Skip whitespace
-            if (isWhitespace(input[pos])) {
-                pos += 1;
-                continue;
-            }
-
-            const start = pos;
-            const char = input[pos];
-
-            // Try single-character tokens first
-            const token_type: ?TokenType = switch (char) {
-                '+' => .PLUS,
-                '*' => .STAR,
-                '(' => .LPAREN,
-                ')' => .RPAREN,
-                else => null,
-            };
-
-            if (token_type) |tt| {
-                tokens = tokens ++ &[_]Token{.{ .type = tt, .lexeme = input[pos .. pos + 1], .pos = pos }};
-                pos += 1;
-            } else if (isDigit(char)) {
-                // Parse number (including optional decimal point)
-                while (pos < input.len and (isDigit(input[pos]) or input[pos] == '.')) {
-                    pos += 1;
-                }
-                tokens = tokens ++ &[_]Token{.{ .type = .NUMBER, .lexeme = input[start..pos], .pos = start }};
-            } else {
-                // Invalid character - use sentinel
-                tokens = tokens ++ &[_]Token{.{ .type = .INVALID, .lexeme = input[pos .. pos + 1], .pos = pos }};
-                pos += 1;
-            }
-        }
-
-        // Add EOF token
-        tokens = tokens ++ &[_]Token{.{ .type = .EOF, .lexeme = "", .pos = input.len }};
-        return tokens;
-    }
-}
-
-// ============================================================================
-// Parser
-// ============================================================================
-
 pub const OpType = enum {
     ADD,
+    SUB,
     MUL,
 };
 
@@ -597,6 +569,7 @@ pub const ASTNode = union(enum) {
             .BinOp => |b| {
                 const op_str = switch (b.op) {
                     .ADD => "+",
+                    .SUB => "-",
                     .MUL => "*",
                 };
                 try writer.print("({} {} {})", .{ b.lhs.*, op_str, b.rhs.* });
@@ -615,166 +588,6 @@ pub const OldParseResult = struct {
     error_info: ?OldParseError,
     pos: usize, // current position in token stream
 };
-
-/// Parser state
-const OldParser = struct {
-    tokens: []const Token,
-    pos: usize,
-
-    fn init(tokens: []const Token) OldParser {
-        return .{ .tokens = tokens, .pos = 0 };
-    }
-
-    fn peek(self: *const OldParser) Token {
-        if (self.pos < self.tokens.len) {
-            return self.tokens[self.pos];
-        }
-        return self.tokens[self.tokens.len - 1]; // EOF
-    }
-
-    fn advance(self: *OldParser) void {
-        if (self.pos < self.tokens.len) {
-            self.pos += 1;
-        }
-    }
-
-    fn expect(self: *OldParser, comptime token_type: TokenType) ?OldParseError {
-        const tok = self.peek();
-        if (tok.type != token_type) {
-            return OldParseError{
-                .message = "Unexpected token",
-                .pos = tok.pos,
-            };
-        }
-        self.advance();
-        return null;
-    }
-
-    /// Parse expression: handles addition (lowest precedence)
-    fn parseExpression(self: *OldParser, comptime nodes: *[]const ASTNode) ?OldParseError {
-        if (self.parseTerm(nodes)) |err| return err;
-
-        while (self.peek().type == .PLUS) {
-            self.advance();
-            const lhs = &nodes.*[nodes.*.len - 1];
-
-            if (self.parseTerm(nodes)) |err| return err;
-            const rhs = &nodes.*[nodes.*.len - 1];
-
-            // Add BinOp node
-            nodes.* = nodes.* ++ &[_]ASTNode{.{
-                .BinOp = .{
-                    .op = .ADD,
-                    .lhs = lhs,
-                    .rhs = rhs,
-                },
-            }};
-        }
-
-        return null;
-    }
-
-    /// Parse term: handles multiplication (higher precedence)
-    fn parseTerm(self: *OldParser, comptime nodes: *[]const ASTNode) ?OldParseError {
-        if (self.parsePrimary(nodes)) |err| return err;
-
-        while (self.peek().type == .STAR) {
-            self.advance();
-            const lhs = &nodes.*[nodes.*.len - 1];
-
-            if (self.parsePrimary(nodes)) |err| return err;
-            const rhs = &nodes.*[nodes.*.len - 1];
-
-            // Add BinOp node
-            nodes.* = nodes.* ++ &[_]ASTNode{.{
-                .BinOp = .{
-                    .op = .MUL,
-                    .lhs = lhs,
-                    .rhs = rhs,
-                },
-            }};
-        }
-
-        return null;
-    }
-
-    /// Parse primary: numbers and parenthesized expressions
-    fn parsePrimary(self: *OldParser, comptime nodes: *[]const ASTNode) ?OldParseError {
-        const tok = self.peek();
-
-        switch (tok.type) {
-            .NUMBER => {
-                self.advance();
-                // Parse the float value here in the parser
-                const val = std.fmt.parseFloat(f32, tok.lexeme) catch {
-                    return OldParseError{
-                        .message = "Invalid number format",
-                        .pos = tok.pos,
-                    };
-                };
-                nodes.* = nodes.* ++ &[_]ASTNode{.{ .Scalar = val }};
-                return null;
-            },
-            .LPAREN => {
-                self.advance();
-                if (self.parseExpression(nodes)) |err| return err;
-                if (self.expect(.RPAREN)) |err| return err;
-                return null;
-            },
-            .INVALID => {
-                return OldParseError{
-                    .message = "Invalid token in input",
-                    .pos = tok.pos,
-                };
-            },
-            .EOF => {
-                return OldParseError{
-                    .message = "Unexpected end of input",
-                    .pos = tok.pos,
-                };
-            },
-            else => {
-                return OldParseError{
-                    .message = "Expected number or '('",
-                    .pos = tok.pos,
-                };
-            },
-        }
-    }
-};
-
-/// Parse tokens into AST at comptime
-pub fn parse(comptime tokens: []const Token) OldParseResult {
-    comptime {
-        var parser = OldParser.init(tokens);
-        var nodes: []const ASTNode = &.{};
-
-        if (parser.parseExpression(&nodes)) |err| {
-            return OldParseResult{
-                .node = null,
-                .error_info = err,
-                .pos = parser.pos,
-            };
-        }
-
-        if (parser.peek().type != .EOF) {
-            return OldParseResult{
-                .node = null,
-                .error_info = OldParseError{
-                    .message = "Expected end of input",
-                    .pos = parser.peek().pos,
-                },
-                .pos = parser.pos,
-            };
-        }
-
-        return OldParseResult{
-            .node = nodes[nodes.len - 1],
-            .error_info = null,
-            .pos = parser.pos,
-        };
-    }
-}
 
 // ============================================================================
 // Evaluator
@@ -801,43 +614,43 @@ fn evaluateNode(comptime BasisType: type, comptime node: ASTNode, vars: anytype)
     }
 }
 
-/// Main eval function: tokenize, parse, and evaluate an expression at comptime
-pub fn eval(basis: anytype, comptime expr: []const u8, vars: anytype) @TypeOf(basis).Multivector {
-    comptime {
-        const tokens = tokenize(expr);
-        const parse_result = parse(tokens);
+// Main eval function: tokenize, parse, and evaluate an expression at comptime
 
-        if (parse_result.error_info) |err| {
-            @compileError("Parse error at position " ++ std.fmt.comptimePrint("{d}", .{err.pos}) ++ ": " ++ err.message);
-        }
+// pub fn eval(basis: anytype, comptime expr: []const u8, vars: anytype) @TypeOf(basis).Multivector {
+//     comptime {
+//         const tokens = tokenize(expr);
+//         const parse_result = parse(tokens);
 
-        const ast = parse_result.node orelse @compileError("No AST generated");
-        return evaluateNode(@TypeOf(basis), ast, vars);
-    }
-}
+//         if (parse_result.error_info) |err| {
+//             @compileError("Parse error at position " ++ std.fmt.comptimePrint("{d}", .{err.pos}) ++ ": " ++ err.message);
+//         }
+
+//         const ast = parse_result.node orelse @compileError("No AST generated");
+//         return evaluateNode(@TypeOf(basis), ast, vars);
+//     }
+// }
 
 // ============================================================================
 // Tests
 // ============================================================================
 
 test "tokenize: single number" {
-    const tokens = comptime tokenize("42");
-    try std.testing.expectEqual(2, tokens.len);
+    const tokens = comptime tokenize.parse("42").?.match;
+    try std.testing.expectEqual(1, tokens.len);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[0].type);
     try std.testing.expectEqualStrings("42", tokens[0].lexeme);
-    try std.testing.expectEqual(TokenType.EOF, tokens[1].type);
 }
 
 test "tokenize: decimal number" {
-    const tokens = comptime tokenize("3.14");
-    try std.testing.expectEqual(2, tokens.len);
+    const tokens = comptime tokenize.parse("3.14").?.match;
+    try std.testing.expectEqual(1, tokens.len);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[0].type);
     try std.testing.expectEqualStrings("3.14", tokens[0].lexeme);
 }
 
 test "tokenize: addition" {
-    const tokens = comptime tokenize("1+2");
-    try std.testing.expectEqual(4, tokens.len);
+    const tokens = comptime tokenize.parse("1+2").?.match;
+    try std.testing.expectEqual(3, tokens.len);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[0].type);
     try std.testing.expectEqualStrings("1", tokens[0].lexeme);
     try std.testing.expectEqual(TokenType.PLUS, tokens[1].type);
@@ -846,94 +659,93 @@ test "tokenize: addition" {
 }
 
 test "tokenize: multiplication with spaces" {
-    const tokens = comptime tokenize("2 * 3");
-    try std.testing.expectEqual(4, tokens.len);
+    const tokens = comptime tokenize.parse("2 * 3").?.match;
+    try std.testing.expectEqual(3, tokens.len);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[0].type);
     try std.testing.expectEqual(TokenType.STAR, tokens[1].type);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[2].type);
 }
 
 test "tokenize: parentheses" {
-    const tokens = comptime tokenize("(1+2)");
-    try std.testing.expectEqual(6, tokens.len);
+    const tokens = comptime tokenize.parse("(1+2)").?.match;
+    try std.testing.expectEqual(5, tokens.len);
     try std.testing.expectEqual(TokenType.LPAREN, tokens[0].type);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[1].type);
     try std.testing.expectEqual(TokenType.PLUS, tokens[2].type);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[3].type);
     try std.testing.expectEqual(TokenType.RPAREN, tokens[4].type);
-    try std.testing.expectEqual(TokenType.EOF, tokens[5].type);
 }
 
 test "tokenize: invalid character" {
-    const tokens = comptime tokenize("1@2");
-    try std.testing.expectEqual(4, tokens.len);
+    const tokens = comptime tokenize.parse("1@2").?.match;
+    try std.testing.expectEqual(3, tokens.len);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[0].type);
     try std.testing.expectEqual(TokenType.INVALID, tokens[1].type);
     try std.testing.expectEqualStrings("@", tokens[1].lexeme);
     try std.testing.expectEqual(TokenType.NUMBER, tokens[2].type);
 }
 
-test "parse: single number" {
-    const tokens = comptime tokenize("42");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info == null);
-    try std.testing.expect(result.node != null);
-    const node = result.node.?;
-    try std.testing.expect(node == .Scalar);
-    try std.testing.expectEqual(42.0, node.Scalar);
-}
+// test "parse: single number" {
+//     const tokens = comptime tokenize("42");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info == null);
+//     try std.testing.expect(result.node != null);
+//     const node = result.node.?;
+//     try std.testing.expect(node == .Scalar);
+//     try std.testing.expectEqual(42.0, node.Scalar);
+// }
 
-test "parse: addition" {
-    const tokens = comptime tokenize("1+2");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info == null);
-    try std.testing.expect(result.node != null);
-    const node = result.node.?;
-    try std.testing.expect(node == .BinOp);
-    try std.testing.expectEqual(OpType.ADD, node.BinOp.op);
-    try std.testing.expectEqual(1.0, node.BinOp.lhs.Scalar);
-    try std.testing.expectEqual(2.0, node.BinOp.rhs.Scalar);
-}
+// test "parse: addition" {
+//     const tokens = comptime tokenize("1+2");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info == null);
+//     try std.testing.expect(result.node != null);
+//     const node = result.node.?;
+//     try std.testing.expect(node == .BinOp);
+//     try std.testing.expectEqual(OpType.ADD, node.BinOp.op);
+//     try std.testing.expectEqual(1.0, node.BinOp.lhs.Scalar);
+//     try std.testing.expectEqual(2.0, node.BinOp.rhs.Scalar);
+// }
 
-test "parse: multiplication" {
-    const tokens = comptime tokenize("2*3");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info == null);
-    const node = result.node.?;
-    try std.testing.expect(node == .BinOp);
-    try std.testing.expectEqual(OpType.MUL, node.BinOp.op);
-}
+// test "parse: multiplication" {
+//     const tokens = comptime tokenize("2*3");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info == null);
+//     const node = result.node.?;
+//     try std.testing.expect(node == .BinOp);
+//     try std.testing.expectEqual(OpType.MUL, node.BinOp.op);
+// }
 
-test "parse: precedence (multiplication before addition)" {
-    const tokens = comptime tokenize("1+2*3");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info == null);
-    const node = result.node.?;
-    // Should parse as: 1 + (2 * 3)
-    try std.testing.expect(node == .BinOp);
-    try std.testing.expectEqual(OpType.ADD, node.BinOp.op);
-    try std.testing.expectEqual(1.0, node.BinOp.lhs.Scalar);
-    try std.testing.expect(node.BinOp.rhs.* == .BinOp);
-    try std.testing.expectEqual(OpType.MUL, node.BinOp.rhs.BinOp.op);
-}
+// test "parse: precedence (multiplication before addition)" {
+//     const tokens = comptime tokenize("1+2*3");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info == null);
+//     const node = result.node.?;
+//     // Should parse as: 1 + (2 * 3)
+//     try std.testing.expect(node == .BinOp);
+//     try std.testing.expectEqual(OpType.ADD, node.BinOp.op);
+//     try std.testing.expectEqual(1.0, node.BinOp.lhs.Scalar);
+//     try std.testing.expect(node.BinOp.rhs.* == .BinOp);
+//     try std.testing.expectEqual(OpType.MUL, node.BinOp.rhs.BinOp.op);
+// }
 
-test "parse: parentheses override precedence" {
-    const tokens = comptime tokenize("(1+2)*3");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info == null);
-    const node = result.node.?;
-    // Should parse as: (1 + 2) * 3
-    try std.testing.expect(node == .BinOp);
-    try std.testing.expectEqual(OpType.MUL, node.BinOp.op);
-    try std.testing.expect(node.BinOp.lhs.* == .BinOp);
-    try std.testing.expectEqual(OpType.ADD, node.BinOp.lhs.BinOp.op);
-}
+// test "parse: parentheses override precedence" {
+//     const tokens = comptime tokenize("(1+2)*3");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info == null);
+//     const node = result.node.?;
+//     // Should parse as: (1 + 2) * 3
+//     try std.testing.expect(node == .BinOp);
+//     try std.testing.expectEqual(OpType.MUL, node.BinOp.op);
+//     try std.testing.expect(node.BinOp.lhs.* == .BinOp);
+//     try std.testing.expectEqual(OpType.ADD, node.BinOp.lhs.BinOp.op);
+// }
 
-test "parse: error on invalid token" {
-    const tokens = comptime tokenize("1@2");
-    const result = comptime parse(tokens);
-    try std.testing.expect(result.error_info != null);
-}
+// test "parse: error on invalid token" {
+//     const tokens = comptime tokenize("1@2");
+//     const result = comptime parse(tokens);
+//     try std.testing.expect(result.error_info != null);
+// }
 
 test "tag parser: match" {
     const input_data = "hello world";
