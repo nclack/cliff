@@ -26,21 +26,37 @@ pub fn build(b: *std.Build) void {
     });
     run_tests.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    // DSL module
-    const dsl_module = b.createModule(.{
-        .root_source_file = b.path("src/dsl.zig"),
+    // Pare module
+    const parse_module = b.createModule(.{
+        .root_source_file = b.path("src/parse.zig"),
         .target = target,
     });
 
-    // DSL unit tests
-    const dsl_tests = b.addTest(.{
+    // Parse unit tests
+    const parse_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/dsl.zig"),
+            .root_source_file = b.path("src/parse.zig"),
             .target = target,
         }),
     });
-    dsl_tests.root_module.addImport("cliff", lib.root_module);
-    run_tests.dependOn(&b.addRunArtifact(dsl_tests).step);
+    run_tests.dependOn(&b.addRunArtifact(parse_tests).step);
+
+    // expr module
+    const expr_module = b.createModule(.{
+        .root_source_file = b.path("src/expr.zig"),
+        .target = target,
+    });
+
+    // expr unit tests
+    const expr_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/expr.zig"),
+            .target = target,
+        }),
+    });
+    expr_tests.root_module.addImport("cliff", lib.root_module);
+    expr_tests.root_module.addImport("parse", parse_module);
+    run_tests.dependOn(&b.addRunArtifact(expr_tests).step);
 
     // Integration tests
     const integration_tests = b.addTest(.{
@@ -50,6 +66,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     integration_tests.root_module.addImport("cliff", lib.root_module);
-    integration_tests.root_module.addImport("dsl", dsl_module);
+    integration_tests.root_module.addImport("expr", expr_module);
     run_tests.dependOn(&b.addRunArtifact(integration_tests).step);
 }
